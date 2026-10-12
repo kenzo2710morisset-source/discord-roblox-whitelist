@@ -4,6 +4,7 @@ const { Client, GatewayIntentBits, SlashCommandBuilder, REST, Routes } = require
 
 const app = express();
 app.use(express.json());
+const API_KEY = process.env.API_KEY;
 
 const client = new Client({
   intents: [
@@ -59,18 +60,17 @@ app.get("/", (req, res) => {
 });
 
 app.get("/whitelist/:userId", async (req, res) => {
+  if (req.headers["x-api-key"] !== API_KEY) {
+    return res.status(401).json({ error: "Non autorisé" });
+  }
+
   try {
     const guild = await client.guilds.fetch(process.env.DISCORD_GUILD_ID);
     const member = await guild.members.fetch(req.params.userId);
     const allowed = member.roles.cache.has(process.env.DISCORD_ROLE_ID);
+
     res.json({ allowed });
   } catch (error) {
     res.status(404).json({ allowed: false });
   }
 });
-
-app.listen(process.env.PORT || 3000, () => {
-  console.log("Serveur web démarré !");
-});
-
-client.login(process.env.DISCORD_TOKEN);
