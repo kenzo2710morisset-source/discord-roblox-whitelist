@@ -74,3 +74,9 @@ app.get("/whitelist/:userId", async (req, res) => {
     res.status(404).json({ allowed: false });
   }
 });
+
+app.listen(process.env.PORT || 3000, () => {
+  console.log("Serveur web démarré !");
+});
+
+client.login(process.env.DISCORD_TOKEN);
