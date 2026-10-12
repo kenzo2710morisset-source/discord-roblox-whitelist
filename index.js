@@ -15,10 +15,11 @@ app.use(express.json({ limit: "10kb" }));
 const API_KEY = process.env.API_KEY;
 const GUILD_ID = process.env.DISCORD_GUILD_ID;
 const ROLE_ID = process.env.DISCORD_ROLE_ID;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-// Codes temporaires et associations en mémoire
+// Les codes restent temporaires ; les liaisons sont enregistrées dans Supabase.
 const codes = new Map();
-const links = new Map();
 
 const client = new Client({
   intents: [
@@ -43,6 +44,38 @@ function authorized(req, res, next) {
     return res.status(401).json({ error: "Non autorisé" });
   }
   next();
+}
+
+// Appels à l'API REST de Supabase
+async function dbRequest(path, method = "GET", body = null, prefer = "") {
+  if (!SUPABASE_URL || !SUPABASE_KEY) {
+    throw new Error("Configuration Supabase manquante");
+  }
+
+  const options = {
+    method,
+    headers: {
+      apikey: SUPABASE_KEY,
+      Authorization: `Bearer ${SUPABASE_KEY}`,
+      "Content-Type": "application/json"
+    }
+  };
+
+  if (prefer) options.headers.Prefer = prefer;
+  if (body !== null) options.body = JSON.stringify(body);
+
+  const response = await fetch(
+    `${SUPABASE_URL.replace(/\/$/, "")}/rest/v1/${path}`,
+    options
+  );
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`Supabase ${response.status}: ${text}`);
+  }
+
+  return text ? JSON.parse(text) : null;
 }
 
 client.once("ready", async () => {
@@ -92,22 +125,41 @@ client.on("interactionCreate", async interaction => {
       });
     }
 
-    // Un compte Roblox ne peut être lié qu'à un seul Discord.
-    for (const [discordId, robloxId] of links) {
-      if (robloxId === entry.robloxId) links.delete(discordId);
-    }
+    const robloxId = entry.robloxId;
+    const discordId = interaction.user.id;
 
-    links.set(interaction.user.id, entry.robloxId);
+    // Empêche un même compte Roblox ou Discord d'avoir plusieurs liaisons.
+    // On supprime les anciennes liaisons correspondantes avant d'en créer une.
+    const filters =
+      `?or=(roblox_user_id.eq.${robloxId},discord_user_id.eq.${discordId})`;
+
+    await dbRequest(
+      `roblox_discord_links${filters}`,
+      "DELETE",
+      null,
+      "return=minimal"
+    );
+
+    await dbRequest(
+      "roblox_discord_links",
+      "POST",
+      {
+        roblox_user_id: robloxId,
+        discord_user_id: discordId
+      },
+      "return=minimal"
+    );
+
     codes.delete(code);
 
     return interaction.reply({
-      content: "Compte Roblox lié ! Tu peux rejoindre le jeu.",
+      content: "Compte Roblox lié et sauvegardé ! Tu n'auras pas à le relier à chaque connexion.",
       ephemeral: true
     });
   } catch (error) {
     console.error("Erreur liaison :", error);
     return interaction.reply({
-      content: "Impossible de vérifier ton rôle. Réessaie plus tard.",
+      content: "Impossible d'enregistrer la liaison. Réessaie plus tard.",
       ephemeral: true
     });
   }
@@ -117,7 +169,7 @@ app.get("/", (req, res) => {
   res.send("Service de whitelist en ligne !");
 });
 
-// Roblox demande un code temporaire depuis un Script serveur.
+// Crée un code temporaire pour un compte Roblox.
 app.post("/link/create", authorized, (req, res) => {
   const robloxId = String(req.body.robloxUserId || "");
 
@@ -125,7 +177,6 @@ app.post("/link/create", authorized, (req, res) => {
     return res.status(400).json({ error: "Identifiant Roblox invalide" });
   }
 
-  // Limite le nombre de codes actifs pour un même compte.
   for (const [code, entry] of codes) {
     if (entry.robloxId === robloxId) codes.delete(code);
   }
@@ -140,31 +191,38 @@ app.post("/link/create", authorized, (req, res) => {
   res.json({ code, expiresInSeconds: 600 });
 });
 
-// Roblox vérifie l'accès d'un joueur lié.
+// Vérifie si le compte Roblox est lié et si son Discord a le rôle requis.
 app.get("/whitelist/:robloxUserId", authorized, async (req, res) => {
   const robloxId = String(req.params.robloxUserId);
-  let discordId = null;
 
-  for (const [id, linkedRobloxId] of links) {
-    if (linkedRobloxId === robloxId) {
-      discordId = id;
-      break;
-    }
-  }
-
-  if (!discordId) {
-    return res.json({ allowed: false });
+  if (!/^\d{1,20}$/.test(robloxId)) {
+    return res.status(400).json({ error: "Identifiant Roblox invalide" });
   }
 
   try {
-    const guild = await client.guilds.fetch(GUILD_ID);
-    const member = await guild.members.fetch(discordId);
-    const allowed = member.roles.cache.has(ROLE_ID);
+    const rows = await dbRequest(
+      `roblox_discord_links?select=discord_user_id&roblox_user_id=eq.${robloxId}`
+    );
 
-    res.json({ allowed });
+    if (!rows || rows.length === 0) {
+      return res.json({ allowed: false, linked: false });
+    }
+
+    const discordId = rows[0].discord_user_id;
+
+    try {
+      const guild = await client.guilds.fetch(GUILD_ID);
+      const member = await guild.members.fetch(discordId);
+      const allowed = member.roles.cache.has(ROLE_ID);
+
+      return res.json({ allowed, linked: true });
+    } catch (error) {
+      // La liaison est conservée même si le rôle a été retiré.
+      return res.json({ allowed: false, linked: true });
+    }
   } catch (error) {
-    // En cas de doute ou d'erreur, l'accès est refusé.
-    res.json({ allowed: false });
+    console.error("Erreur vérification Supabase :", error);
+    return res.status(500).json({ error: "Vérification indisponible" });
   }
 });
 
